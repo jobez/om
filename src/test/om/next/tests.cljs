@@ -75,6 +75,12 @@
   (is (= (om/focus-query '[:foo ({:people [:name :age]} {:length 3}) :bar] [:people])
          '[({:people [:name :age]} {:length 3})])))
 
+(deftest test-focus-query-union
+  (is (= (om/focus-query [{:selected/item {:item/one [:title]
+                                           :item/two [:author]}}]
+                         [:selected/item :item/two])
+         [{:selected/item {:item/two [:author] :om.next/union true}}])))
+
 ;; -----------------------------------------------------------------------------
 ;; Query Templating
 
@@ -102,6 +108,20 @@
                [])
            (om/replace [:app/title])))))
 
+(deftest test-query-template-union
+  (is (= (-> (om/query-template
+               [{:selected/item {:item/one [:title]
+                                 :item/two [:author]}}]
+               [:selected/item :item/two])
+           zip/root)
+         [{:selected/item [:author]}])
+      (= (-> (om/query-template
+               [{:selected/item {:item/one [:title]
+                                 :item/two [:author]}}]
+               [:selected/item :item/two])
+           (om/replace [:caption]))
+        [{:selected/item [:caption]}])))
+
 ;; -----------------------------------------------------------------------------
 ;; Indexer
 
@@ -121,23 +141,45 @@
 ;; -----------------------------------------------------------------------------
 ;; Parser
 
-(deftest test-ast
-  (is (= (parser/->ast :foo)
+(deftest test-expr->ast
+  (is (= (parser/expr->ast :foo)
          {:type :prop :key :foo :dkey :foo}))
-  (is (= (parser/->ast [:foo 0])
-         {:type :prop :key [:foo 0] :dkey :foo :params {:id 0}}))
-  (is (= (parser/->ast {:foo [:bar]})
+  (is (= (parser/expr->ast [:foo 0])
+         {:type :prop :key [:foo 0] :dkey :foo :params {:om.next/refid 0}}))
+  (is (= (parser/expr->ast {:foo [:bar]})
          {:type :prop :key :foo :dkey :foo :sel [:bar]}))
-  (is (= (parser/->ast {[:foo 0] [:bar]})
-          {:type :prop :key [:foo 0] :dkey :foo :params {:id 0} :sel [:bar]}))
-  (is (= (parser/->ast '(:foo {:bar 1}))
+  (is (= (parser/expr->ast {[:foo 0] [:bar]})
+          {:type :prop :key [:foo 0] :dkey :foo :params {:om.next/refid 0} :sel [:bar]}))
+  (is (= (parser/expr->ast '(:foo {:bar 1}))
          {:type :prop :key :foo :dkey :foo :params {:bar 1}}))
-  (is (= (parser/->ast '({:foo [:bar :baz]} {:woz 1}))
+  (is (= (parser/expr->ast '({:foo [:bar :baz]} {:woz 1}))
          {:type :prop :key :foo :dkey :foo :sel [:bar :baz] :params {:woz 1}}))
-  (is (= (parser/->ast '({[:foo 0] [:bar :baz]} {:woz 1}))
-         {:type :prop :key [:foo 0] :dkey :foo :sel [:bar :baz] :params {:id 0 :woz 1}}))
-  (is (= (parser/->ast '(do/it {:woz 1}))
-         {:type :call :key 'do/it :dkey 'do/it :params {:woz 1}})))
+  (is (= (parser/expr->ast '({[:foo 0] [:bar :baz]} {:woz 1}))
+         {:type :prop :key [:foo 0] :dkey :foo :sel [:bar :baz] :params {:om.next/refid 0 :woz 1}}))
+  (is (= (parser/expr->ast '(do/it {:woz 1}))
+         {:type :call :key 'do/it :dkey 'do/it :params {:woz 1}}))
+  (is (= (parser/expr->ast '(do/it))
+         {:type :call :key 'do/it :dkey 'do/it :params {}})))
+
+(deftest test-ast->expr
+  (is (= (parser/ast->expr {:type :prop :key :foo :dkey :foo})
+         :foo))
+  (is (= (parser/ast->expr {:type :prop :key [:foo 0] :dkey :foo :params {:om.next/refid 0}})
+         [:foo 0]))
+  (is (= (parser/ast->expr {:type :prop :key :foo :dkey :foo :sel [:bar]})
+         {:foo [:bar]}))
+  (is (= (parser/ast->expr {:type :prop :key [:foo 0] :dkey :foo :params {:om.next/refid 0} :sel [:bar]})
+         {[:foo 0] [:bar]}))
+  (is (= (parser/ast->expr {:type :prop :key :foo :dkey :foo :params {:bar 1}})
+         '(:foo {:bar 1})))
+  (is (= (parser/ast->expr {:type :prop :key :foo :dkey :foo :sel [:bar :baz] :params {:woz 1}})
+         '({:foo [:bar :baz]} {:woz 1})))
+  (is (= (parser/ast->expr {:type :prop :key [:foo 0] :dkey :foo :sel [:bar :baz] :params {:om.next/refid 0 :woz 1}})
+         '({[:foo 0] [:bar :baz]} {:woz 1})))
+  (is (= (parser/ast->expr {:type :call :key 'do/it :dkey 'do/it :params {:woz 1}})
+         '(do/it {:woz 1})))
+  (is (= (parser/ast->expr {:type :call :key 'do/it :dkey 'do/it :params {}})
+         '(do/it))))
 
 (defmulti read (fn [env k params] k))
 
@@ -185,26 +227,26 @@
     (is (= (p {} [:baz/woz]) {}))
     (is (= (p {:state st} [:foo/bar]) {:foo/bar 1}))
     (is (= (p {:state st} [:foo/bar :baz/woz]) {:foo/bar 1}))
-    (is (= (p {} [:baz/woz] {:remote true}) [:baz/woz]))
-    (is (= (p {:state st} [:foo/bar] {:remote true}) []))
-    (is (= (p {:state st} [:foo/bar :baz/woz] {:remote true}) [:baz/woz]))))
+    (is (= (p {} [:baz/woz] :remote) [:baz/woz]))
+    (is (= (p {:state st} [:foo/bar] :remote) []))
+    (is (= (p {:state st} [:foo/bar :baz/woz] :remote) [:baz/woz]))))
 
 (deftest test-value-and-remote
   (let [st (atom {:woz/noz 1})]
     (is (= (p {:state st} [:woz/noz]) {:woz/noz 1}))
-    (is (= (p {:state st} [:woz/noz] {:remote true}) [:woz/noz]))))
+    (is (= (p {:state st} [:woz/noz] :remote) [:woz/noz]))))
 
 (deftest test-call
   (let [st (atom {:foo/bar 1})]
     (is (= (p {:state st} '[(do/it! {:id 0})]) '{do/it! [0]}))
-    (is (= (p {} '[(do/it! {:id 0})] {:remote true})
+    (is (= (p {} '[(do/it! {:id 0})] :remote)
            '[(do/it! {:id 0})]))))
 
 (deftest test-read-call
   (let [st (atom {:foo/bar 1})]
     (is (= (p {:state st} '[(:user/pic {:size :small})])
            {:user/pic "user50x50.png"}))
-    (is (= (p {:state st} '[(:user/pic {:size :small})] {:remote true})
+    (is (= (p {:state st} '[(:user/pic {:size :small})] :remote)
            '[(:user/pic {:size :small})]))))
 
 (defmethod mutate 'mutate!
@@ -215,7 +257,7 @@
 (deftest test-remote-does-not-mutate
   (let [st (atom {:count 0})
         _  (p {:state st} '[(mutate!)])
-        _  (p (:state st) '[(mutate!)] {:remote true})]
+        _  (p (:state st) '[(mutate!)] :remote)]
     (is (= @st {:count 1}))))
 
 (defmethod read :now/wow
@@ -231,16 +273,16 @@
   (let [st (atom {:foo/bar 1})]
     (is (= (p {:state st} [[:user/by-id 0]])
            {[:user/by-id 0] {:name/first "Bob" :name/last "Smith"}}))
-    (is (= (p {:state st} [[:user/by-id 0]] {:remote true})
+    (is (= (p {:state st} [[:user/by-id 0]] :remote)
            [[:user/by-id 0]]))
     (is (= (p {:state st} [{[:user/by-id 0] [:name/last]}])
            {[:user/by-id 0] {:name/last "Smith"}}))
-    (is (= (p {:state st} [{[:user/by-id 0] [:name/last]}] {:remote true})
+    (is (= (p {:state st} [{[:user/by-id 0] [:name/last]}] :remote)
            [{[:user/by-id 0] [:name/last]}]))))
 
 (deftest test-forced-remote
   (is (= (p {} '['(foo/bar)]) {}))
-  (is (= (p {} '['(foo/bar)] {:remote true}) '[(foo/bar)])))
+  (is (= (p {} '['(foo/bar)] :remote) '[(foo/bar)])))
 
 (defmethod mutate 'this/throws
   [_ _ _]
@@ -271,7 +313,7 @@
     (is (= (p {:state state} '[(action/no-value)]) {}))
     (is (= :changed @state)))
   (let [state (atom nil)]
-    (is (= (p {:state state} '[(action/no-value)] {:remote true}) []))
+    (is (= (p {:state state} '[(action/no-value)] :remote) []))
     (is (= nil @state))))
 
 ;; -----------------------------------------------------------------------------
@@ -300,9 +342,9 @@
   {:value (get-in @state [:categories (get data k)])})
 
 (defmethod read :todos/list
-  [{:keys [state selector parse] :as env} _]
+  [{:keys [state selector parser] :as env} _]
   (let [st @state
-        pf #(parse (assoc env :data %) selector)]
+        pf #(parser (assoc env :data %) selector)]
     {:value (into [] (comp (map (:todos st)) (map pf))
               (:todos/list st))}))
 
@@ -371,3 +413,126 @@
   (require '[cljs.pprint :as pp])
   (run-tests)
   )
+
+;; -----------------------------------------------------------------------------
+;; Denormalization
+
+(deftest test-denormalization
+  (let [orig {:name "Susan" :points 5 :friend {:name "Mary"} :friends []}
+        p0   (om/normalize Person orig)
+        refs (meta p0)]
+    (is (= orig (om/denormalize (om/get-query Person) p0 refs)))))
+
+(def people-data
+  {:people [{:id 0 :name "Bob" :friends []}
+            {:id 1 :name "Laura" :friends []}
+            {:id 2 :name "Mary" :friends []}]})
+
+(defui Friend1
+  static om/Ident
+  (ident [this props]
+    [:person/by-id (:id props)])
+  static om/IQuery
+  (query [this]
+    [:id :name]))
+
+(defui Person1
+  static om/Ident
+  (ident [this props]
+    [:person/by-id (:id props)])
+  static om/IQuery
+  (query [this]
+    [:id :name {:friends (om/get-query Friend1)}]))
+
+(defui People1
+  static om/IQuery
+  (query [this]
+    [{:people (om/get-query Person1)}]))
+
+(defmulti read2 om/dispatch)
+
+(defmethod read2 :people
+  [{:keys [state selector] :as env} key _]
+  (let [st @state]
+    {:value (om/denormalize selector (get st key) st)}))
+
+(defn add-friend [state id friend]
+  (if (not= id friend)
+    (letfn [(add* [friends ref]
+              (cond-> friends
+                (not (some #{ref} friends)) (conj ref)))]
+      (-> state
+        (update-in [:person/by-id id :friends]
+          add* [:person/by-id friend])
+        (update-in [:person/by-id friend :friends]
+          add* [:person/by-id id])))
+    state))
+
+(deftest test-denormalize-collection
+  (let [norm-data  (om/normalize People1 people-data true)
+        app-state  (atom norm-data)
+        parser     (om/parser {:read read2})
+        norm-data' (add-friend (om/normalize People1 people-data true) 0 1)
+        app-state' (atom norm-data')]
+    (is (= (parser {:state app-state} (om/get-query People1))
+           {:people [{:id 0, :name "Bob", :friends []}
+                     {:id 1, :name "Laura", :friends []}
+                     {:id 2, :name "Mary", :friends []}]}))
+    (is (= (parser {:state app-state'} (om/get-query People1))
+          {:people [{:id 0, :name "Bob", :friends [{:id 1, :name "Laura"}]}
+                    {:id 1, :name "Laura", :friends [{:id 0, :name "Bob"}]}
+                    {:id 2, :name "Mary", :friends []}]}))))
+
+;; -----------------------------------------------------------------------------
+;; Message Forwarding
+
+(defui Post
+  static om/IQuery
+  (query [this]
+    [:id :type :title :author :content]))
+
+(defui Photo
+  static om/IQuery
+  (query [this]
+    [:id :type :title :image :caption]))
+
+(defui Graphic
+  static om/IQuery
+  (query [this]
+    [:id :type :title :image]))
+
+(defui DashboardItem
+  static om/Ident
+  (ident [this {:keys [id type]}]
+    [type id])
+  static om/IQuery
+  (query [this]
+    (zipmap
+      [:dashboard/post :dashboard/photo :dashboard/graphic]
+      (map #(conj % :favorites)
+        [(om/get-query Post)
+         (om/get-query Photo)
+         (om/get-query Graphic)]))))
+
+(defui Dashboard
+  static om/IQuery
+  (query [this]
+    [{:dashboard/items (om/get-query DashboardItem)}]))
+
+(defmulti read1 om/dispatch)
+
+(defmethod read1 :default
+  [_ _ _])
+
+(defmethod read1 :dashboard/items
+  [{:keys [parse ast] :as env} _ _]
+  {:remote (update-in ast [:sel]
+             #(into {} (map (fn [[k v]] [k [:favorites]])) %))})
+
+(deftest test-recursive-remote
+  (let [parser (om/parser {:read read1})]
+    (is (= (parser {} (om/get-query Dashboard) :remote)
+           [{:dashboard/items
+             {:dashboard/post    [:favorites],
+              :dashboard/photo   [:favorites],
+              :dashboard/graphic [:favorites]}}]))))

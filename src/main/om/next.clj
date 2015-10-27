@@ -33,7 +33,7 @@
     componentWillUpdate [this next-props next-state]
     componentDidUpdate [this prev-props prev-state]
     componentWillMount [this]
-    componentWilUnmount [this]
+    componentWillUnmount [this]
     render [this]})
 
 (defn validate-sig [[name sig :as method]]
@@ -51,22 +51,24 @@
     'componentWillReceiveProps
     (fn [[name [this next-props :as args] & body]]
       `(~name ~args
-         (let [~next-props (goog.object/get ~next-props "omcljs$value")]
+         (let [~next-props (om.next/-next-props ~next-props ~this)]
            ~@body)))
     'componentWillUpdate
     (fn [[name [this next-props next-state :as args] & body]]
       `(~name ~args
-         (let [~next-props (goog.object/get ~next-props "omcljs$value")
+         (let [~next-props (om.next/-next-props ~next-props ~this)
                ~next-state (goog.object/get ~next-state "omcljs$pendingState")
                ret# (do ~@body)]
+           (om.next/merge-pending-props! ~this)
            (om.next/merge-pending-state! ~this)
            ret#)))
     'componentDidUpdate
     (fn [[name [this prev-props prev-state :as args] & body]]
       `(~name ~args
-         (let [~prev-props (goog.object/get ~prev-props "omcljs$value")
+         (let [~prev-props (om.next/-prev-props ~prev-props ~this)
                ~prev-state (goog.object/get ~prev-state "omcjls$previousState")]
-           ~@body)))
+           ~@body
+           (om.next/clear-prev-props! ~this))))
     'componentWillMount
     (fn [[name [this :as args] & body]]
       `(~name ~args
@@ -100,7 +102,7 @@
      ([this#]
        (boolean
          (goog.object/getValueByKeys this#
-           "_reactInternalInstance" "_renderedComponent")) )
+           "_reactInternalInstance" "_renderedComponent")))
      ~'shouldComponentUpdate
      ([this# next-props# next-state#]
        (or (not= (om.next/props this#)
@@ -109,8 +111,12 @@
                 (not= (goog.object/get (. this# ~'-state) "omcljs$state")
                       (goog.object/get next-state# "omcljs$state")))))
      ~'componentWillUpdate
-     ([this# prev-props# prev-state#]
+     ([this# next-props# next-state#]
+       (om.next/merge-pending-props! this#)
        (om.next/merge-pending-state! this#))
+     ~'componentDidUpdate
+     ([this# prev-props# prev-state#]
+       (om.next/clear-prev-props! this#))
      ~'componentWillMount
      ([this#]
        (let [indexer# (get-in (om.next/get-reconciler this#) [:config :indexer])]

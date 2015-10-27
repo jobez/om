@@ -1,4 +1,4 @@
-(defproject org.omcljs/om "1.0.0-alpha4-SNAPSHOT"
+(defproject org.omcljs/om "1.0.0-alpha11"
   :description "ClojureScript interface to Facebook's React"
   :url "http://github.com/swannodette/om"
   :license {:name "Eclipse"
@@ -51,7 +51,7 @@
               :source-paths ["src" "examples/state_bug/src"]
               :compiler {
                 :main examples.state-bug.core
-                :asset-path "out"         
+                :asset-path "out"
                 :output-to "examples/state_bug/main.js"
                 :output-dir "examples/state_bug/out"
                 :source-map true
