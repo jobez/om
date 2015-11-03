@@ -112,12 +112,16 @@
           (into [] (comp (filter match) (map value) (take 1)) query))))))
 
 (defn- focus->path
-  ([focus] (focus->path focus []))
-  ([focus path]
-   (if (and (some map? focus)
+  ([focus]
+   (focus->path focus '* []))
+  ([focus bound]
+   (focus->path focus bound []))
+  ([focus bound path]
+   (if (and (or (= bound '*) (not= path bound))
+            (some map? focus)
             (== 1 (count focus)))
      (let [[k focus'] (ffirst focus)]
-       (recur focus' (conj path k)))
+       (recur focus' bound (conj path k)))
      path)))
 
 ;; =============================================================================
@@ -413,6 +417,28 @@
       (-> component .-props get-props)
       (-> component .-state get-props))))
 
+(defn computed
+  "Add computed properties to props."
+  [props computed-map]
+  (if (vector? props)
+    (cond-> props
+      (not (empty? computed-map)) (vary-meta assoc :om.next/computed computed-map))
+    (cond-> props
+      (not (empty? computed-map)) (assoc :om.next/computed computed-map))))
+
+(defn get-computed
+  "Return the computed properties on a component or its props."
+  ([x]
+   (get-computed x []))
+  ([x k-or-ks]
+   (let [props (cond-> x (component? x) props)
+         ks    (into [:om.next/computed]
+                 (cond-> k-or-ks
+                   (not (sequential? k-or-ks)) vector))]
+     (if (vector? props)
+       (-> props meta (get-in ks))
+       (get-in props ks)))))
+
 (defn get-ident
   "Given a component return its ident"
   [component]
@@ -567,7 +593,13 @@
       (if (iquery? p)
         (recur p (cons (type p) ret))
         (recur p ret))
-      ret)))
+      (let [seen (atom #{})]
+        (take-while
+          (fn [x]
+            (when-not (contains? @seen x)
+              (swap! seen conj x)
+              x))
+          ret)))))
 
 (defn- join-value [node]
   (if (seq? node)
@@ -862,8 +894,14 @@
            qs    (get-in @(-> component get-reconciler get-indexer)
                    [:class-path->query cp])]
        (if-not (empty? qs)
-         (replace (first (filter #(= path' (-> % zip/root focus->path)) qs))
-           (get-query component))
+         ;; handle case where child appears multiple times at same class-path
+         ;; but with different queries
+         (let [q (first (filter #(= path' (-> % zip/root (focus->path path'))) qs))]
+           (if-not (nil? q)
+             (replace q (get-query component))
+             (throw
+               (ex-info (str "No queries exist for component path " cp " or data path " path')
+                 {:type :om.next/no-queries}))))
          (throw
            (ex-info (str "No queries exist for component path " cp)
              {:type :om.next/no-queries})))))))
@@ -930,12 +968,14 @@
                 (recur (next q) (assoc ret k v))))))
         ret))))
 
-(defn normalize
-  "Given a Om component class or instance and some data, use the component's
-   query to transform the data into normal form. If merge-ref option is true,
-   will return refs in the result instead of as metadata."
+(defn tree->db
+  "Given a Om component class or instance and a tree of data, use the component's
+   query to transform the tree into the default database format. All nodes that
+   can be mapped via Ident implementations wil be replaced with ident links. The
+   original node data will be moved into tables indexed by ident. If merge-ref
+   option is true, will return these tables in the result instead of as metadata."
   ([x data]
-    (normalize x data false))
+    (tree->db x data false))
   ([x data ^boolean merge-refs]
    (let [refs (atom {})
          x    (if (vector? x) x (get-query x))
@@ -957,12 +997,13 @@
 
 ;; TODO: easy to optimize
 
-(defn denormalize
-  "Given a selector, normalized data, and the normalized application state
-   return the denormalized data."
+(defn db->tree
+  "Given a selector, some data in the default database format, and the entire
+   application state in the default database format, return the tree where all
+   ident links have been replaced with their original node values."
   [selector data refs]
   (if (vector? data)
-    (into [] (map #(denormalize selector (get-in refs %) refs)) data)
+    (into [] (map #(db->tree selector (get-in refs %) refs)) data)
     (let [{props false joins true} (group-by join? selector)]
       (loop [joins (seq joins) ret {}]
         (if-not (nil? joins)
@@ -971,9 +1012,9 @@
                 v         (get data key)]
             (if-not (ref? v)
               (recur (next joins)
-                (assoc ret key (denormalize sel v refs)))
+                (assoc ret key (db->tree sel v refs)))
               (recur (next joins)
-                (assoc ret key (denormalize sel (get-in refs v) refs)))))
+                (assoc ret key (db->tree sel (get-in refs v) refs)))))
           (merge (select-keys data props) ret))))))
 
 ;; =============================================================================
@@ -987,7 +1028,7 @@
     (letfn [(step [tree' [ref props]]
               (if (:normalize config)
                 (let [c      (ref->any indexer ref)
-                      props' (normalize c props)
+                      props' (tree->db c props)
                       refs   (meta props')]
                   ((:merge-tree config) (merge-ref config tree' ref props') refs))
                 (merge-ref config tree' ref props)))]
@@ -999,7 +1040,7 @@
         root        (:root @(:state reconciler))
         [refs res'] (sift-refs res)
         res'        (if (:normalize config)
-                      (normalize root res' true)
+                      (tree->db root res' true)
                       res')]
     (swap! (:state config)
       #(-> %
@@ -1027,7 +1068,7 @@
         (p/index-root (:indexer config) root-class))
       (when (and (:normalize config)
                  (not (:normalized @state)))
-        (let [new-state (normalize root-class @(:state config))
+        (let [new-state (tree->db root-class @(:state config))
               refs      (meta new-state)]
           (reset! (:state config) (merge new-state refs))
           (swap! state assoc :normalized true)
@@ -1064,7 +1105,9 @@
                          (dissoc :remove)))
                      ((:root-unmount config) target))})
         (add-watch (:state config) target
-          (fn [_ _ _ _] (schedule-render! this)))
+          (fn [_ _ _ _]
+            (swap! state update-in [:t] inc)
+            (schedule-render! this)))
         (parsef)
         ret)))
 
@@ -1078,11 +1121,7 @@
         (p/index-root (:indexer config) root))))
 
   (queue! [_ ks]
-    (swap! state
-      (fn [state]
-        (-> state
-          (update-in [:t] inc) ;; TODO: probably should revisit doing this here
-          (update-in [:queue] into ks)))))
+    (swap! state update-in [:queue] into ks))
 
   (queue-sends! [_ sends]
     (swap! state update-in [:queued-sends]
@@ -1105,6 +1144,7 @@
     (let [st @state
           q  (:queue st)]
       (cond
+        ;; TODO: need to move root re-render logic outside of batching logic
         (empty? q) ((:render st))
 
         (= [::skip] q) nil
@@ -1116,12 +1156,13 @@
               {:keys [ui->props]} config
               env (to-env config)]
           (doseq [c ((:optimize config) cs)]
-            (let [next-props (ui->props env c)]
-              (when (and (should-update? c next-props (get-state c))
-                         (mounted? c))
-                (if-not (nil? next-props)
-                  (update-component! c next-props)
-                  (.forceUpdate c)))))))
+            (when (mounted? c)
+              (let [computed   (get-computed (props c))
+                    next-props (om.next/computed (ui->props env c) computed)]
+                (when (should-update? c next-props (get-state c))
+                  (if-not (nil? next-props)
+                    (update-component! c next-props)
+                    (.forceUpdate c))))))))
       (swap! state assoc :queue [])
       (swap! state update-in [:queued] not)))
 
@@ -1143,7 +1184,14 @@
   (let [path (path c)
         fq   (full-query c path)]
     (when-not (nil? fq)
-      (get-in (parser env fq) path))))
+      (let [s  (system-time)
+            ui (parser env fq)
+            e  (system-time)]
+        (when-not (nil? *logger*)
+          (let [dt (- e s)]
+            (when (< 16 dt)
+              (glog/warning *logger* (str c " query took " dt " msecs")))))
+        (get-in ui path)))))
 
 (defn- default-merge-ref
   [_ tree ref props]
@@ -1153,17 +1201,23 @@
   "Construct a reconciler from a configuration map, the following options
    are required:
 
-   :state   - the application state, must be IAtom.
-   :parser  - the parser to be used
-   :send    - required only if the parser will return a non-empty value when
-              run against the supplied :remotes. send is a function of two
-              arguments, the map of remote expressions keyed by remote target
-              and a callback which should be invoked with the result from each
-              remote target. Note this means the callback can be invoked
-              multiple times to support parallel fetching and incremental
-              loading if desired.
-   :remotes - a vector of keywords representing remote services which can
-              evaluate query expressions. Defaults to [:remote]"
+   :state        - the application state, must be IAtom.
+   :normalize    - whether the state should be normalized. If true it is assumed
+                   all novelty introduced into the system will also need
+                   normalization.
+   :parser       - the parser to be used
+   :send         - required only if the parser will return a non-empty value when
+                   run against the supplied :remotes. send is a function of two
+                   arguments, the map of remote expressions keyed by remote target
+                   and a callback which should be invoked with the result from each
+                   remote target. Note this means the callback can be invoked
+                   multiple times to support parallel fetching and incremental
+                   loading if desired.
+   :remotes      - a vector of keywords representing remote services which can
+                   evaluate query expressions. Defaults to [:remote]
+   :root-render  - the root render function. Defaults to ReactDOM.render
+   :root-unmount - the root unmount function. Defaults to
+                   ReactDOM.unmountComponentAtNode"
   [{:keys [state shared parser indexer
            ui->props normalize
            send merge-sends remotes
