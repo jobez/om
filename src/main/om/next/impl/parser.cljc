@@ -25,10 +25,9 @@
     (assoc ast :type :prop :sel v)))
 
 (defn ref->ast [[k id :as ref]]
-  {:type   :prop
-   :dkey   k
-   :key    ref
-   :params {:om.next/refid id}})
+  {:type :prop
+   :dkey k
+   :key  ref})
 
 (defn expr->ast [x]
   (cond
@@ -41,22 +40,14 @@
                    (ex-info (str "Invalid expression " x)
                      {:type :error/invalid-expression}))))
 
-(defn ast->expr [{:keys [key sel] :as ast}]
-  (let [ref?    (vector? key)
-        ast'    (cond-> ast
-                  ref? (update-in [:params] dissoc :om.next/refid))
-        params  (:params ast')
-        empty?  (zero? (count params))
-        ast''   (cond-> ast'
-                  (and ref? empty?) (dissoc :params))
-        params' (:params ast'')]
-    (if-not (nil? params')
-      (if (zero? (count params'))
-        (list (ast->expr (dissoc ast'' :params)))
-        (list (ast->expr (dissoc ast'' :params)) params'))
-      (if-not (nil? sel)
-        {key sel}
-        key))))
+(defn ast->expr [{:keys [key sel params] :as ast}]
+  (if-not (nil? params)
+    (if-not (empty? params)
+      (list (ast->expr (dissoc ast :params)) params)
+      (list (ast->expr (dissoc ast :params))))
+    (if-not (nil? sel)
+      {key sel}
+      key)))
 
 (defn path-meta [x path]
   (let [x' (cond->> x
@@ -67,18 +58,28 @@
          :cljs (satisfies? IWithMeta x'))
       (vary-meta assoc :om-path path))))
 
+(defn rethrow? [x]
+  (and (instance? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) x)
+       (= :om.next/abort (-> x ex-data :type))))
+
 (defn parser [{:keys [read mutate] :as config}]
   (fn self
     ([env sel] (self env sel nil))
     ([env sel target]
      (let [elide-paths? (boolean (:elide-paths config))
            {:keys [path] :as env}
-           (cond-> (assoc env :parser self :target target)
+           (cond-> (assoc env :parser self :target target :query/root :om.next/root)
              (not (contains? env :path)) (assoc :path []))]
        (letfn [(step [ret expr]
-                 (let [{:keys [key dkey params sel] :as ast} (expr->ast expr)
-                       env   (cond-> (assoc env :ast ast)
-                               (not (nil? sel)) (assoc :selector sel))
+                 (let [{sel' :sel :keys [key dkey params] :as ast} (expr->ast expr)
+                       env   (as-> (assoc env :ast ast) env
+                               (if (= '... sel')
+                                 (assoc env :selector sel)
+                                 (cond-> env
+                                   (not (nil? sel')) (assoc :selector sel')))
+                               (if (vector? key)
+                                 (assoc env :query/root key)
+                                 env))
                        type  (:type ast)
                        call? (= :call type)
                        res   (when (nil? (:target ast))
@@ -101,10 +102,10 @@
                          (when (and call? (not (nil? (:action res))))
                            (try
                              ((:action res))
-                             #?(:clj  (catch Throwable e
-                                        (reset! error e))
-                                :cljs (catch :default e
-                                        (reset! error e)))))
+                             (catch #?(:clj Throwable :cljs :default) e
+                               (if (rethrow? e)
+                                 (throw e)
+                                 (reset! error e)))))
                          (let [value (:value res)]
                            (cond-> ret
                              (not (nil? value)) (assoc key value)
