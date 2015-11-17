@@ -1,5 +1,5 @@
 (ns om.next
-  (:refer-clojure :exclude [var? key replace])
+  (:refer-clojure :exclude [var? key replace force])
   (:require-macros [om.next :refer [defui]])
   (:require [goog.string :as gstring]
             [goog.object :as gobj]
@@ -101,6 +101,9 @@
     (ffirst node)
     (first node)))
 
+(defn- join-value [join]
+  (second (join-entry join)))
+
 (defn- join? [x]
   (let [x (if (seq? x) (first x) x)]
     (map? x)))
@@ -149,9 +152,10 @@
 (defprotocol Ident
   (ident [this props] "Return the ref for this component"))
 
-(extend-type default
-  Ident
-  (ident [this props] this))
+(defn ^boolean ident?
+  "Returns true if x satisfies? Ident"
+  [x]
+  (satisfies? Ident x))
 
 (defprotocol IQueryParams
   (params [this] "Return the query parameters"))
@@ -291,7 +295,9 @@
 (defn ^boolean component?
   "Returns true if the argument is an Om component."
   [x]
-  (. x -om$isComponent))
+  (if-not (nil? x)
+    (. x -om$isComponent)
+    false))
 
 (defn- state [c]
   {:pre [(component? c)]}
@@ -419,7 +425,7 @@
          ks     (cond-> k-or-ks
                   (not (sequential? k-or-ks)) vector)]
      (cond-> shared
-       (not (empty? ks)) (get-in shared ks)))))
+       (not (empty? ks)) (get-in ks)))))
 
 (defn instrument [component]
   {:pre [(component? component)]}
@@ -449,30 +455,26 @@
   "Add computed properties to props. Note will replace any pre-existing
    computed properties."
   [props computed-map]
-  (if (vector? props)
-    (cond-> props
-      (not (empty? computed-map)) (vary-meta assoc :om.next/computed computed-map))
-    (cond-> props
-      (not (empty? computed-map)) (assoc :om.next/computed computed-map))))
+  (when-not (nil? props)
+    (if (vector? props)
+      (cond-> props
+        (not (empty? computed-map)) (vary-meta assoc :om.next/computed computed-map))
+      (cond-> props
+        (not (empty? computed-map)) (assoc :om.next/computed computed-map)))))
 
 (defn get-computed
   "Return the computed properties on a component or its props."
   ([x]
    (get-computed x []))
   ([x k-or-ks]
-   (let [props (cond-> x (component? x) props)
-         ks    (into [:om.next/computed]
-                 (cond-> k-or-ks
-                   (not (sequential? k-or-ks)) vector))]
-     (if (vector? props)
-       (-> props meta (get-in ks))
-       (get-in props ks)))))
-
-(defn get-ident
-  "Given a component return its ident"
-  [component]
-  {:pre [(component? component)]}
-  (ident component (props component)))
+   (when-not (nil? x)
+     (let [props (cond-> x (component? x) props)
+           ks    (into [:om.next/computed]
+                   (cond-> k-or-ks
+                     (not (sequential? k-or-ks)) vector))]
+       (if (vector? props)
+         (-> props meta (get-in ks))
+         (get-in props ks))))))
 
 (declare schedule-render!)
 
@@ -546,12 +548,25 @@
    {:pre [(component? component)]}
    (.setState component #js {:omcljs$state new-state} nil)))
 
-;; TODO: will need to reindex
+(declare full-query to-env schedule-sends!)
+
+(defn gather-sends
+  [{:keys [parser] :as env} q remotes]
+  (into {}
+    (comp
+      (map #(vector % (parser env q %)))
+      (filter (fn [[_ v]] (pos? (count v)))))
+    remotes))
 
 (defn set-query!
-  "Change the query of a component. Will schedule a re-render."
-  [component new-query]
-  {:pre [(component? component)]}
+  "Change the query of a component. Takes a map containing :params and/or
+   :query. :params should be a map of new bindings and :query should be a query
+   expression. Will schedule a re-render as well as remote re-sends if
+   necessary."
+  [component {:keys [params query]}]
+  {:pre [(component? component)
+         (or (not (nil? params))
+             (not (nil? query)))]}
   (let [r   (get-reconciler component)
         cfg (:config r)
         st  (:state cfg)
@@ -559,31 +574,21 @@
         _   (.add (:history cfg) id @st)]
     (when-let [l (:logger cfg)]
       (glog/info l
-        (str (when-let [ref (ident component (props component))]
+        (str (when-let [ref (when (ident? component)
+                              (ident component (props component)))]
                (str (pr-str ref) " "))
-          "changed query '" new-query ", " (pr-str id))))
-    (swap! st update-in [:om.next/queries component] merge {:query new-query})
+          (when query  "changed query '" query ", ")
+          (when params "changed params " params " ")
+          (pr-str id))))
+    (swap! st update-in [:om.next/queries component] merge
+      (merge (when query {:query query}) (when params {:params params})))
     (p/queue! r [component])
     (p/reindex! r)
-    nil))
-
-(defn set-params!
-  "Change the query parameters of a component. Will schedule a re-render."
-  [component new-params]
-  {:pre [(component? component)]}
-  (let [r   (get-reconciler component)
-        cfg (:config r)
-        st  (:state cfg)
-        id  (random-uuid)
-        _   (.add (:history cfg) id @st)]
-    (when-let [l (:logger cfg)]
-      (glog/info l
-        (str (when-let [ref (ident component (props component))]
-               (str (pr-str ref) " "))
-          "changed query params " new-params", " (pr-str id))))
-    (swap! st update-in [:om.next/queries component] merge {:params new-params})
-    (p/queue! r [component])
-    (p/reindex! r)
+    (let [sends (gather-sends (to-env cfg)
+                  (full-query component) (:remotes cfg))]
+      (when-not (empty? sends)
+        (p/queue-sends! r sends)
+        (schedule-sends! r)))
     nil))
 
 (defn ^boolean mounted?
@@ -641,6 +646,12 @@
     (if (and (component? x) (mounted? x))
       (get-query (react-ref x ref))
       (get-query subquery-class))))
+
+(defn get-ident
+  "Given a component return its ident"
+  [component]
+  {:pre [(component? component)]}
+  (ident component (props component)))
 
 ;; =============================================================================
 ;; Reconciler API
@@ -708,17 +719,9 @@
   (let [config (if (reconciler? x) (:config x) x)]
     (select-keys config [:state :shared :parser :logger :pathopt])))
 
-(defn gather-sends
-  [{:keys [parser] :as env} tx remotes]
-  (into {}
-    (comp
-      (map #(vector % (parser env tx %)))
-      (filter (fn [[_ v]] (pos? (count v)))))
-    remotes))
-
 (defn transact* [r c ref tx]
   (let [cfg  (:config r)
-        ref  (if (and c (not ref))
+        ref  (if (and c (ident? c) (not ref))
                (ident c (props c))
                ref)
         env  (merge
@@ -741,6 +744,23 @@
       (p/queue-sends! r snds)
       (schedule-sends! r))))
 
+(declare ref->components)
+
+(defn transform-reads [r tx]
+  (letfn [(add-focused-query [k tx c]
+            (->> (focus-query (get-query c) [k])
+              (full-query c)
+              (into tx)))]
+    (loop [ks (seq tx) tx' []]
+      (if-not (nil? ks)
+        (let [k (first ks)]
+          (if (keyword? k)
+            (recur (next ks)
+              (reduce #(add-focused-query k %1 %2)
+                tx' (ref->components r k)))
+            (recur (next ks) (conj tx' k))))
+        tx'))))
+
 (defn transact!
   "Given a reconciler or component run a transaction. tx is a parse expression
    that should include mutations followed by any necessary read. The reads will
@@ -762,7 +782,8 @@
               " that does not implement IQuery"))
        (loop [p (parent x) x x tx tx]
          (if (nil? p)
-           (transact* (get-reconciler x) x nil tx)
+           (let [r (get-reconciler x)]
+             (transact* r x nil (transform-reads r tx)))
            (let [[x' tx] (if (satisfies? ITxIntercept p)
                           [p (tx-intercept p tx)]
                           [x tx])]
@@ -798,7 +819,7 @@
           class-path->query (atom {})
           rootq             (get-query x)
           class             (cond-> x (component? x) type)]
-      (letfn [(build-index* [class selector path classpath]
+      (letfn [(build-index* [class query path classpath]
                 (let [recursive? (some #{class} classpath)
                       classpath  (cond-> classpath
                                    (and (not (nil? class))
@@ -810,28 +831,28 @@
                       (query-template (focus-query rootq path) path)))
                   (when-not recursive?
                     (cond
-                      (vector? selector)
-                      (let [{props false joins true} (group-by join? selector)]
+                      (vector? query)
+                      (let [{props false joins true} (group-by join? query)]
                         (when class
                           (swap! prop->classes
                             #(merge-with into % (zipmap props (repeat #{class})))))
                         (doseq [join joins]
-                          (let [[prop selector'] (join-entry join)
-                                selector'        (if (= '... selector')
-                                                   selector
-                                                   selector')]
+                          (let [[prop query'] (join-entry join)
+                                query'        (if (= '... query')
+                                                   query
+                                                   query')]
                             (when class
                               (swap! prop->classes
                                 #(merge-with into % {prop #{class}})))
-                            (let [class' (-> selector' meta :component)]
-                              (build-index* class' selector'
+                            (let [class' (-> query' meta :component)]
+                              (build-index* class' query'
                                 (conj path prop) classpath)))))
 
                       ;; Union query case
-                      (map? selector)
-                      (doseq [[prop selector'] selector]
-                        (let [class' (-> selector' meta :component)]
-                          (build-index* class' selector'
+                      (map? query)
+                      (doseq [[prop query'] query]
+                        (let [class' (-> query' meta :component)]
+                          (build-index* class' query'
                             (conj path prop) classpath)))))))]
         (build-index* class rootq [] [])
         (swap! indexes merge
@@ -844,8 +865,9 @@
         (let [indexes (update-in indexes
                         [:class->components (type c)]
                         (fnil conj #{}) c)
-              ref     (ident c (props c))]
-          (if-not (component? ref)
+              ref     (when (ident? c)
+                        (ident c (props c)))]
+          (if-not (nil? ref)
             (cond-> indexes
               ref (update-in [:ref->components ref] (fnil conj #{}) c))
             indexes)))))
@@ -856,8 +878,9 @@
         (let [indexes (update-in indexes
                         [:class->components (type c)]
                         disj c)
-              ref     (ident c (props c))]
-          (if-not (component? ref)
+              ref     (when (ident? c)
+                        (ident c (props c)))]
+          (if-not (nil? ref)
             (cond-> indexes
               ref (update-in [:ref->components ref] disj c))
             indexes)))))
@@ -920,14 +943,16 @@
    om.next/get-query."
   ([component]
    (when (satisfies? IQuery component)
-     (replace
-       (first
-         (get-in @(-> component get-reconciler get-indexer)
-           [:class-path->query (class-path component)]))
-       (get-query component))))
-  ([component path]
+     (if (nil? (path component))
+       (replace
+         (first
+           (get-in @(-> component get-reconciler get-indexer)
+             [:class-path->query (class-path component)]))
+         (get-query component))
+       (full-query component (get-query component)))))
+  ([component query]
    (when (satisfies? IQuery component)
-     (let [path' (into [] (remove number?) path)
+     (let [path' (into [] (remove number?) (path component))
            cp    (class-path component)
            qs    (get-in @(-> component get-reconciler get-indexer)
                    [:class-path->query cp])]
@@ -936,7 +961,7 @@
          ;; but with different queries
          (let [q (first (filter #(= path' (-> % zip/root (focus->path path'))) qs))]
            (if-not (nil? q)
-             (replace q (get-query component))
+             (replace q query)
              (throw
                (ex-info (str "No queries exist for component path " cp " or data path " path')
                  {:type :om.next/no-queries}))))
@@ -946,56 +971,67 @@
 
 ;; for advanced optimizations
 (defn to-class [class]
-  (if (not (satisfies? Ident class))
-    (js/Object.create (. class -prototype))
-    class))
+  (when-not (nil? class)
+    (if (not (satisfies? Ident class))
+      (js/Object.create (. class -prototype))
+      class)))
 
-(defn- normalize* [selector data refs]
+(defn- normalize* [query data refs]
   (cond
-    (= '[*] selector) data
+    (= '[*] query) data
 
     ;; union case
-    (map? selector)
-    (let [class (to-class (-> selector meta :component))
-          ref   (ident class data)]
-      (normalize* (get selector (first ref)) data refs))
+    (map? query)
+    (let [class (to-class (-> query meta :component))
+          ref   (when (ident? class)
+                  (ident class data))]
+      (if-not (nil? ref)
+        (normalize* (get query (first ref)) data refs)
+        (throw (js/Error. "Union components must implement Ident"))))
+
+    (vector? data) data ;; already normalized
 
     :else
-    (loop [q (seq selector) ret {}]
+    (loop [q (seq query) ret data]
       (if-not (nil? q)
         (let [node (first q)]
           (if (join? node)
             (let [[k sel] (join-entry node)
                   sel     (if (= '... sel)
-                            selector
+                            query
                             sel)
                   class   (to-class (-> sel meta :component))
                   v       (get data k)]
               (cond
                 ;; normalize one
                 (map? v)
-                (let [x (normalize* sel v refs)
-                      i (ident class v)]
-                  (swap! refs update-in [(first i) (second i)] merge x)
-                  (recur (next q) (assoc ret k i)))
+                (let [x (normalize* sel v refs)]
+                  (if-not (or (nil? class) (not (ident? class)))
+                    (let [i (ident class v)]
+                      (swap! refs update-in [(first i) (second i)] merge x)
+                      (recur (next q) (assoc ret k i)))
+                    (recur (next q) (assoc ret k x))))
 
                 ;; normalize many
                 (vector? v)
-                (let [xs (into [] (map #(normalize* sel % refs)) v)
-                      is (into [] (map #(ident class %)) xs)]
-                  (if (vector? sel)
-                    (when-not (empty? is)
-                      (swap! refs update-in [(ffirst is)]
-                        (fn [ys]
-                          (merge-with merge ys
-                            (zipmap (map second is) xs)))))
-                    (swap! refs
-                      (fn [refs']
-                        (reduce
-                          (fn [ret [i x]]
-                            (update-in ret i merge x))
-                          refs' (map vector is xs)))))
-                  (recur (next q) (assoc ret k is)))
+                (let [xs (into [] (map #(normalize* sel % refs)) v)]
+                  (if-not (or (nil? class) (not (ident? class)))
+                    (let [is (into [] (map #(ident class %)) xs)]
+                      (if (vector? sel)
+                        (when-not (empty? is)
+                          (swap! refs update-in [(ffirst is)]
+                            (fn [ys]
+                              (merge-with merge ys
+                                (zipmap (map second is) xs)))))
+                        ;; union case
+                        (swap! refs
+                          (fn [refs']
+                            (reduce
+                              (fn [ret [i x]]
+                                (update-in ret i merge x))
+                              refs' (map vector is xs)))))
+                      (recur (next q) (assoc ret k is)))
+                    (recur (next q) (assoc ret k xs))))
 
                 ;; missing key
                 (nil? v)
@@ -1023,7 +1059,9 @@
          x    (if (vector? x) x (get-query x))
          ret  (normalize* x data refs)]
      (if merge-refs
-       (merge ret @refs)
+       (let [refs' @refs]
+         (assoc (merge ret refs')
+           ::tables (into #{} (keys refs'))))
        (with-meta ret @refs)))))
 
 (defn- sift-refs [res]
@@ -1040,32 +1078,76 @@
 ;; TODO: easy to optimize
 
 (defn db->tree
-  "Given a selector, some data in the default database format, and the entire
+  "Given a query, some data in the default database format, and the entire
    application state in the default database format, return the tree where all
    ident links have been replaced with their original node values."
-  [selector data refs]
-  {:pre [(map? refs)]}
-  (let [data (cond->> data (ref? data) (get-in refs))]
-    (if (vector? data)
-      (into [] (map #(db->tree selector (get-in refs %) refs)) data)
-      (let [{props false joins true} (group-by join? selector)]
-        (loop [joins (seq joins) ret {}]
-          (if-not (nil? joins)
-            (let [join      (first joins)
-                  [key sel] (join-entry join)
-                  sel       (if (= '... sel)
-                              selector
-                              sel)
-                  v         (get data key)]
-              (if-not (ref? v)
-                (recur (next joins)
-                  (assoc ret key (db->tree sel v refs)))
-                (recur (next joins)
-                  (assoc ret key (db->tree sel (get-in refs v) refs)))))
-            (merge (select-keys data props) ret)))))))
+  ([query data refs]
+    (db->tree query data refs identity))
+  ([query data refs map-ident]
+   {:pre [(map? refs)]}
+    ;; support taking ident for data param
+   (let [data (cond-> data (ref? data) (->> map-ident (get-in refs)))]
+     (if (vector? data)
+       ;; join
+       (into []
+         (map #(db->tree query (get-in refs (map-ident %)) refs map-ident))
+         data)
+       ;; map case
+       (let [{props false joins true} (group-by join? query)]
+         (loop [joins (seq joins) ret {}]
+           (if-not (nil? joins)
+             (let [join      (first joins)
+                   [key sel] (join-entry join)
+                   sel       (if (= '... sel)
+                               query
+                               sel)
+                   v         (get data key)]
+               (if-not (ref? v)
+                 (recur (next joins)
+                   (assoc ret
+                     key (db->tree sel v refs map-ident)))
+                 (recur (next joins)
+                   (assoc ret
+                     key (db->tree sel
+                           (get-in refs (map-ident v)) refs map-ident)))))
+             (merge (select-keys data props) ret))))))))
 
 ;; =============================================================================
 ;; Reconciler
+
+(defn rewrite [paths]
+  (fn [res]
+    (letfn [(step [res [k orig-path]]
+              (-> res
+                (dissoc k)
+                (assoc-in orig-path (get res k))))]
+      (reduce step res paths))))
+
+(defn process-roots
+  "A send helper for rewriting the query to remove client local keys that
+   don't need server side processing. Give a query this function will
+   return a map with two keys, :query and :rewrite. :query is the
+   actual query you should send. Upon receiving the response you should invoke
+   :rewrite on the response before invoking the send callback."
+  [query]
+  (letfn [(process-roots* [query ret path]
+            (loop [ks (seq query)]
+              (if-not (nil? ks)
+                (let [k (first ks)]
+                  (if (true? (-> k meta :query/root))
+                    (swap! ret
+                      #(let [jk (join-key k)]
+                        (-> %
+                          (update-in [:query] conj k)
+                          (assoc-in [:paths jk] (conj path jk)))))
+                    (do
+                      (when (join? k)
+                        (let [[jk jv] (join-entry k)]
+                          (process-roots* jv ret (conj path jk))))
+                      (recur (next ks))))))))]
+    (let [ret (atom {:query [] :paths {}})]
+      (process-roots* query ret [])
+      (assoc @ret :rewrite (rewrite (:paths @ret))))))
 
 (defn- merge-refs [tree config refs]
   (let [{:keys [merge-ref indexer]} config]
@@ -1106,9 +1188,11 @@
         merge  (:merge config)
         {:keys [keys next tempids]} (merge reconciler @state delta)]
     (p/queue! reconciler keys)
-    (doseq [[k new-id] tempids]
-      (.freezeID (get @tempid/tempids k) new-id))
-    (reset! state next)))
+    (reset! state
+      (if-let [migrate (:migrate config)]
+        (migrate next (get-query (:root @(:state reconciler)))
+          tempids (:id-key config))
+        next))))
 
 (defrecord Reconciler [config state]
   IDeref
@@ -1148,17 +1232,10 @@
             parsef  (fn []
                       (let [sel (get-query (or @ret root-class))]
                         (if-not (nil? sel)
-                          (let [env  (to-env config)
-                                v    ((:parser config) env sel)
-                                snds (gather-sends env sel (:remotes config))]
+                          (let [env (to-env config)
+                                v   ((:parser config) env sel)]
                             (when-not (empty? v)
-                              (renderf v))
-                            (when-not (empty? snds)
-                              (when-let [send (:send config)]
-                                (send snds
-                                  #(do
-                                    (merge! this %)
-                                    (renderf ((:parser config) env sel)))))))
+                              (renderf v)))
                           (renderf @(:state config)))))]
         (swap! state merge
           {:target target :render parsef :root root-class
@@ -1175,6 +1252,15 @@
             (swap! state update-in [:t] inc)
             (schedule-render! this)))
         (parsef)
+        (when-let [sel (get-query (or @ret root-class))]
+          (let [env  (to-env config)
+                snds (gather-sends env sel (:remotes config))]
+            (when-not (empty? snds)
+              (when-let [send (:send config)]
+                (send snds
+                  #(do
+                    (merge! this %)
+                    (renderf ((:parser config) env sel))))))))
         @ret)))
 
   (remove-root! [_ target]
@@ -1244,13 +1330,12 @@
 
 (defn- default-ui->props
   [{:keys [parser ^boolean pathopt] :as env} c]
-  (let [ui (when (and pathopt (satisfies? Ident c))
+  (let [ui (when (and pathopt (ident? c) (iquery? c))
              (let [id (ident c (props c))]
                (get (parser env [{id (get-query c)}]) id)))]
     (if-not (nil? ui)
       ui
-      (let [path (path c)
-            fq   (full-query c path)]
+      (let [fq (full-query c)]
         (when-not (nil? fq)
           (let [s  (system-time)
                 ui (parser env fq)
@@ -1259,7 +1344,7 @@
               (let [dt (- e s)]
                 (when (< 16 dt)
                   (glog/warning l (str c " query took " dt " msecs")))))
-            (get-in ui path)))))))
+            (get-in ui (path c))))))))
 
 (defn- default-merge-ref
   [_ tree ref props]
@@ -1270,6 +1355,22 @@
   (if (map? a)
     (merge a b)
     b))
+
+(defn- default-migrate [pure query tempids id-key]
+  (letfn [(dissoc-in [pure [table id]]
+            (assoc pure table (dissoc (get pure table) id)))
+          (step [pure [old [_ id :as new]]]
+            (-> pure
+              (dissoc-in old)
+              (assoc-in new
+                (cond-> (merge (get-in pure old) (get-in pure new))
+                  (not (nil? id-key)) (assoc id-key id)))))]
+    (if-not (empty? tempids)
+      (let [pure' (reduce step pure tempids)]
+        (tree->db query
+          (db->tree query pure' pure'
+            (fn [ident] (get tempids ident ident))) true))
+      pure)))
 
 (defn reconciler
   "Construct a reconciler from a configuration map.
@@ -1309,7 +1410,8 @@
            optimize
            history
            root-render root-unmount
-           pathopt]
+           pathopt
+           migrate id-key]
     :or {ui->props    default-ui->props
          indexer      om.next/indexer
          merge-sends  #(merge-with into %1 %2)
@@ -1321,7 +1423,8 @@
          history      100
          root-render  #(js/ReactDOM.render %1 %2)
          root-unmount #(js/ReactDOM.unmountComponentAtNode %)
-         pathopt      false}
+         pathopt      false
+         migrate      default-migrate}
     :as config}]
   {:pre [(map? config)]}
   (let [idxr   (indexer)
@@ -1340,7 +1443,8 @@
                   :normalize (or (not norm?) normalize)
                   :history (c/cache history)
                   :root-render root-render :root-unmount root-unmount
-                  :logger logger :pathopt pathopt}
+                  :logger logger :pathopt pathopt
+                  :migrate migrate :id-key id-key}
                  (atom {:queue [] :queued false :queued-sends {}
                         :sends-queued false
                         :target nil :root nil :render nil :remove nil
@@ -1366,13 +1470,27 @@
   (.get (-> reconciler :config :history) uuid))
 
 (defn tempid
+  "Return a temporary id."
   ([] (tempid/tempid))
   ([id] (tempid/tempid id)))
 
 (defn reader
+  "Create a Om Next transit reader. This reader can handler the tempid type.
+   Can pass transit reader customization opts map."
   ([] (transit/reader))
   ([opts] (transit/reader opts)))
 
 (defn writer
+  "Create a Om Next transit writer. This writer can handler the tempid type.
+   Can pass transit writer customization opts map."
   ([] (transit/writer))
   ([opts] (transit/writer opts)))
+
+(defn force
+  "Given a query expression return an equivalent query expression that can be
+   spliced into a transaction that will force a read of that key from the
+   specified remote target."
+  ([expr]
+    (force expr :remote))
+  ([expr target]
+    (with-meta (list 'quote expr) {:target target})))

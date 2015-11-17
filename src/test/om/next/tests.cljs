@@ -5,7 +5,8 @@
             [om.next :as om :refer-macros [defui]]
             [om.next.protocols :as p]
             [om.next.impl.parser :as parser]
-            [om.dom :as dom]))
+            [om.dom :as dom]
+            [om.tempid :as tempid :refer [tempid]]))
 
 ;; -----------------------------------------------------------------------------
 ;; Components
@@ -53,13 +54,17 @@
   (is (= (om/get-query ComponentList)
          '[{:components/list [:foo/bar :baz/woz]} :app/title])))
 
-(deftest test-focus-selector
+(deftest test-focus-query
   (is (= (om/focus-query [:foo/bar] [])
          [:foo/bar]))
   (is (= (om/focus-query
            [:foo/bar {:baz/woz [:goz/noz]}]
            [:baz/woz])
          [{:baz/woz [:goz/noz]}]))
+  (is (= (om/focus-query
+           [:foo/bar :baz/woz]
+           [:baz/woz])
+        [:baz/woz]))
   (is (= (om/focus-query
            [:foo/bar {:baz/woz [:goz/noz {:bop/wop [:nop/sop]} :cuz/wuz]}]
            [:baz/woz :bop/wop])
@@ -154,42 +159,42 @@
 
 (deftest test-expr->ast
   (is (= (parser/expr->ast :foo)
-         {:type :prop :key :foo :dkey :foo}))
+         {:type :prop :key :foo :dispatch-key :foo}))
   (is (= (parser/expr->ast [:foo 0])
-         {:type :prop :key [:foo 0] :dkey :foo}))
+         {:type :prop :key [:foo 0] :dispatch-key :foo}))
   (is (= (parser/expr->ast {:foo [:bar]})
-         {:type :prop :key :foo :dkey :foo :sel [:bar]}))
+         {:type :prop :key :foo :dispatch-key :foo :query [:bar]}))
   (is (= (parser/expr->ast {[:foo 0] [:bar]})
-          {:type :prop :key [:foo 0] :dkey :foo :sel [:bar]}))
+          {:type :prop :key [:foo 0] :dispatch-key :foo :query [:bar]}))
   (is (= (parser/expr->ast '(:foo {:bar 1}))
-         {:type :prop :key :foo :dkey :foo :params {:bar 1}}))
+         {:type :prop :key :foo :dispatch-key :foo :params {:bar 1}}))
   (is (= (parser/expr->ast '({:foo [:bar :baz]} {:woz 1}))
-         {:type :prop :key :foo :dkey :foo :sel [:bar :baz] :params {:woz 1}}))
+         {:type :prop :key :foo :dispatch-key :foo :query [:bar :baz] :params {:woz 1}}))
   (is (= (parser/expr->ast '({[:foo 0] [:bar :baz]} {:woz 1}))
-         {:type :prop :key [:foo 0] :dkey :foo :sel [:bar :baz] :params {:woz 1}}))
+         {:type :prop :key [:foo 0] :dispatch-key :foo :query [:bar :baz] :params {:woz 1}}))
   (is (= (parser/expr->ast '(do/it {:woz 1}))
-         {:type :call :key 'do/it :dkey 'do/it :params {:woz 1}}))
+         {:type :call :key 'do/it :dispatch-key 'do/it :params {:woz 1}}))
   (is (= (parser/expr->ast '(do/it))
-         {:type :call :key 'do/it :dkey 'do/it :params {}})))
+         {:type :call :key 'do/it :dispatch-key 'do/it :params {}})))
 
 (deftest test-ast->expr
-  (is (= (parser/ast->expr {:type :prop :key :foo :dkey :foo})
+  (is (= (parser/ast->expr {:type :prop :key :foo :dispatch-key :foo})
          :foo))
-  (is (= (parser/ast->expr {:type :prop :key [:foo 0] :dkey :foo})
+  (is (= (parser/ast->expr {:type :prop :key [:foo 0] :dispatch-key :foo})
          [:foo 0]))
-  (is (= (parser/ast->expr {:type :prop :key :foo :dkey :foo :sel [:bar]})
+  (is (= (parser/ast->expr {:type :prop :key :foo :dispatch-key :foo :query [:bar]})
          {:foo [:bar]}))
-  (is (= (parser/ast->expr {:type :prop :key [:foo 0] :dkey :foo :sel [:bar]})
+  (is (= (parser/ast->expr {:type :prop :key [:foo 0] :dispatch-key :foo :query [:bar]})
          {[:foo 0] [:bar]}))
-  (is (= (parser/ast->expr {:type :prop :key :foo :dkey :foo :params {:bar 1}})
+  (is (= (parser/ast->expr {:type :prop :key :foo :dispatch-key :foo :params {:bar 1}})
          '(:foo {:bar 1})))
-  (is (= (parser/ast->expr {:type :prop :key :foo :dkey :foo :sel [:bar :baz] :params {:woz 1}})
+  (is (= (parser/ast->expr {:type :prop :key :foo :dispatch-key :foo :query [:bar :baz] :params {:woz 1}})
          '({:foo [:bar :baz]} {:woz 1})))
-  (is (= (parser/ast->expr {:type :prop :key [:foo 0] :dkey :foo :sel [:bar :baz] :params {:woz 1}})
+  (is (= (parser/ast->expr {:type :prop :key [:foo 0] :dispatch-key :foo :query [:bar :baz] :params {:woz 1}})
          '({[:foo 0] [:bar :baz]} {:woz 1})))
-  (is (= (parser/ast->expr {:type :call :key 'do/it :dkey 'do/it :params {:woz 1}})
+  (is (= (parser/ast->expr {:type :call :key 'do/it :dispatch-key 'do/it :params {:woz 1}})
          '(do/it {:woz 1})))
-  (is (= (parser/ast->expr {:type :call :key 'do/it :dkey 'do/it :params {}})
+  (is (= (parser/ast->expr {:type :call :key 'do/it :dispatch-key 'do/it :params {}})
          '(do/it))))
 
 (defmulti read (fn [env k params] k))
@@ -218,9 +223,9 @@
     {:value (str "user" size-str ".png") :remote true}))
 
 (defmethod read :user/by-id
-  [{:keys [selector] :as env} k {:keys [id] :as params}]
+  [{:keys [query] :as env} k {:keys [id] :as params}]
   {:value (cond-> {:name/first "Bob" :name/last "Smith"}
-            selector (select-keys selector))
+            query (select-keys query))
    :remote true})
 
 (defmulti mutate (fn [env k params] k))
@@ -272,13 +277,13 @@
     (is (= @st {:count 1}))))
 
 (defmethod read :now/wow
-  [{:keys [state selector]} k params]
-  {:value {:selector selector :params params}})
+  [{:keys [state query]} k params]
+  {:value {:query query :params params}})
 
 (deftest test-parameterized-join
   (let [st (atom {:foo/bar 1})]
     (is (= (p {:state st} '[({:now/wow [:a :b]} {:slice [10 20]})])
-           '{:now/wow {:selector [:a :b] :params {:slice [10 20]}}}))))
+           '{:now/wow {:query [:a :b] :params {:slice [10 20]}}}))))
 
 (deftest test-refs
   (let [st (atom {:foo/bar 1})]
@@ -353,9 +358,9 @@
   {:value (get-in @state [:categories (get data k)])})
 
 (defmethod read :todos/list
-  [{:keys [state selector parser] :as env} _]
+  [{:keys [state query parser] :as env} _]
   (let [st @state
-        pf #(parser (assoc env :data %) selector)]
+        pf #(parser (assoc env :data %) query)]
     {:value (into [] (comp (map (:todos st)) (map pf))
               (:todos/list st))}))
 
@@ -420,11 +425,6 @@
            p0))
     (is (= refs {:person/by-name {"Mary" {:name "Mary"}}}))))
 
-(comment
-  (require '[cljs.pprint :as pp])
-  (run-tests)
-  )
-
 ;; -----------------------------------------------------------------------------
 ;; Denormalization
 
@@ -463,9 +463,9 @@
 (defmulti read2 om/dispatch)
 
 (defmethod read2 :people
-  [{:keys [state selector] :as env} key _]
+  [{:keys [state query] :as env} key _]
   (let [st @state]
-    {:value (om/db->tree selector (get st key) st)}))
+    {:value (om/db->tree query (get st key) st)}))
 
 (defn add-friend [state id friend]
   (if (not= id friend)
@@ -537,7 +537,7 @@
 
 (defmethod read1 :dashboard/items
   [{:keys [parse ast] :as env} _ _]
-  {:remote (update-in ast [:sel]
+  {:remote (update-in ast [:query]
              #(into {} (map (fn [[k v]] [k [:favorites]])) %))})
 
 (deftest test-recursive-remote
@@ -583,14 +583,14 @@
   {:value (get data k)})
 
 (defmethod tree-read :children
-  [{:keys [data parser selector] :as env} _ _]
-  {:value (let [f #(parser (assoc env :data %) selector)]
+  [{:keys [data parser query] :as env} _ _]
+  {:value (let [f #(parser (assoc env :data %) query)]
             (into [] (map f (:children data))))})
 
 (defmethod tree-read :tree
-  [{:keys [state parser selector] :as env} k _]
+  [{:keys [state parser query] :as env} k _]
   (let [st @state]
-    {:value (parser (assoc env :data (:tree st)) selector)}))
+    {:value (parser (assoc env :data (:tree st)) query)}))
 
 (deftest test-recursion-syntax
   (let [tree-parser (om/parser {:read tree-read})]
@@ -616,15 +616,151 @@
 ;; -----------------------------------------------------------------------------
 ;; Path Optimization
 
-(defn read-ident
-  [{:keys [state]} ident query]
-  (om/db->tree query ident @state))
-
-(def tree-parser2
-  (om/parser {:read tree-read :read-ident read-ident}))
+(defmethod tree-read :node/by-id
+  [{:keys [state query query/root]} _ _]
+  {:value (om/db->tree query root @state)})
 
 (deftest test-read-ident
-  (let [state (atom (om/tree->db Tree tree-data true))
-        env   {:state state :ident [:node/by-id 1]}]
-    (is (= (tree-parser2 env (om/get-query Node))
+  (let [state  (atom (om/tree->db Tree tree-data true))
+        parser (om/parser {:read tree-read})
+        env    {:state state}
+        ident  [:node/by-id 1]]
+    (is (= (get (parser env [{ident (om/get-query Node)}]) ident)
            {:id 1, :node-value 2, :children [{:id 2, :node-value 3, :children []}]}))))
+
+;; -----------------------------------------------------------------------------
+;; tempids
+
+(deftest test-temp-id-equality
+  (let [uuid (random-uuid)
+        id0  (tempid uuid)
+        id1  (tempid uuid)]
+    (is (= id0 id1))
+    (is (= (hash id0) (hash id1)))))
+
+(deftest test-tempid-migration
+  (let [db  (assoc-in (om/tree->db Tree tree-data true)
+              [:node/by-id 6] {:id 6})
+        db' (om/default-migrate db (om/get-query Tree)
+              {[:node/by-id 2] [:node/by-id 6]} :id)]
+    (is (nil? (get-in db' [:node/by-id 2])))
+    (is (= (dissoc (get-in db  [:node/by-id 2]) :id)
+           (dissoc (get-in db' [:node/by-id 6]) :id)))))
+
+(def tid (om/tempid))
+
+(def temp-tree-data
+  {:tree {:id 0
+          :node-value 1
+          :children [{:id 1
+                      :node-value 2
+                      :children [{:id 2
+                                  :node-value 3
+                                  :children []}]}
+                     {:id tid
+                      :node-value 4
+                      :children []}]}})
+
+(deftest test-real-tempid-migration
+  (let [db  (assoc-in (om/tree->db Tree tree-data true)
+              [:node/by-id 6] {:id 6})
+        db' (om/default-migrate db (om/get-query Tree)
+              {[:node/by-id tid] [:node/by-id 6]} :id)]
+    (is (nil? (get-in db' [:node/by-id tid])))
+    (is (= (dissoc (get-in db  [:node/by-id tid]) :id)
+           (dissoc (get-in db' [:node/by-id 6]) :id)))))
+
+;; -----------------------------------------------------------------------------
+;; Precise Remoting
+
+(defmulti precise-read om/dispatch)
+
+(defmethod precise-read :default
+  [_ _ _]
+  {:value :not-found})
+
+(defmethod precise-read :fake/key
+  [{:keys [parser ast] :as env} _ _]
+  {:remote (update-in ast [:query]
+             #(parser env % :remote))})
+
+(defmethod precise-read :real/key
+  [{:keys [ast] :as env} _ _]
+  {:remote (assoc ast :query/root true)})
+
+(deftest test-rewrite
+  (is (= ((om/rewrite {:real/key [:fake/key :real/key]})
+           {:real/key 1})
+         {:fake/key {:real/key 1}})))
+
+(deftest test-process-roots
+  (is (= (let [p (om/parser {:read precise-read})]
+           ((:rewrite
+              (om/process-roots
+                (p {:state (atom {})}
+                  [{:fake/key [{:real/key [:id]}]}] :remote)))
+             {:real/key 1}))
+         {:fake/key {:real/key 1}})))
+
+;; -----------------------------------------------------------------------------
+;; User Bugs
+
+(def remove-tree-data
+  {:tree {:id 0
+          :node-value 1
+          :children [{:id 1
+                      :random-key :cool!
+                      :node-value 2
+                      :children [{:id 2
+                                  :node-value 3
+                                  :children []}]}
+                     {:id 3
+                      :node-value 4
+                      :children []}]}})
+
+(deftest test-db->tree-does-not-remove-keys
+  (let [db (om/tree->db Tree remove-tree-data true)]
+    (is (= (get-in db [:node/by-id 1 :random-key]) :cool!))))
+
+(defui Page
+  static om/Ident
+  (ident [this {:keys [id]}]
+    [:pages id])
+  static om/IQuery
+  (query [this]
+    [:id :name]))
+
+(def partial-norm-data
+  {:pages {0 {:id 0 :name "Foo"}
+           1 {:id 1 :name "bar"}}
+   :current-page [:pages 0]})
+
+(deftest test-partially-normalized-data
+  (is (= (om/tree->db (om/get-query Page) partial-norm-data)
+         partial-norm-data)))
+
+(defui SomePost
+  static om/Ident
+  (ident [this {:keys [id]}]
+    [:post/by-id id])
+  static om/IQuery
+  (query [this]
+    '[:id {:user [:username]} :content]))
+
+(defui SomeTimelineComponent
+  static om/IQuery
+  (query [this]
+    (let [subquery (om/get-query SomePost)]
+      `[{:app/posts ~subquery}])))
+
+(def posts-data
+  {:app/posts [{:user {:username "Bob Smith"}
+                :content "Hello World!"
+                :id 1}]})
+
+(deftest test-normalize-nested-query-no-class
+  (is (= (om/tree->db SomeTimelineComponent posts-data true)
+         {:app/posts [[:post/by-id 1]],
+          :post/by-id {1 {:user {:username "Bob Smith"},
+                          :content "Hello World!", :id 1}},
+          :om.next/tables #{:post/by-id}})))
