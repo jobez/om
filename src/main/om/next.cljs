@@ -114,7 +114,16 @@
     (seq? node) (list (focused-join (first node) ks) (second node))
     :else       node))
 
-(defn- focus-query [query path]
+(defn focus-query
+  "Given a query, focus it along the specified path.
+
+  Examples:
+    (om.next/focus-query [:foo :bar :baz] [:foo])
+    => [:foo]
+
+    (om.next/focus-query [{:foo [:bar :baz]} :woz] [:foo :bar])
+    => [{:foo [:bar]}]"
+  [query path]
   (if (empty? path)
     query
     (let [[k & ks] path]
@@ -257,7 +266,7 @@
 (defn- compute-react-key [cl props]
   (if-let [rk (:react-key props)]
     rk
-    (if-let [idx (:om-path props)]
+    (if-let [idx (-> props meta :om-path)]
       (str (. cl -name) "_" idx)
       js/undefined)))
 
@@ -675,7 +684,7 @@
 
 (defn schedule-sends! [reconciler]
   (when (p/schedule-sends! reconciler)
-    (js/setTimeout #(p/send! reconciler) 300)))
+    (js/setTimeout #(p/send! reconciler) 0)))
 
 (declare remove-root!)
 
@@ -986,7 +995,8 @@
           ref   (when (ident? class)
                   (ident class data))]
       (if-not (nil? ref)
-        (normalize* (get query (first ref)) data refs)
+        (vary-meta (normalize* (get query (first ref)) data refs)
+          assoc :om/tag (first ref))
         (throw (js/Error. "Union components must implement Ident"))))
 
     (vector? data) data ;; already normalized
@@ -1089,9 +1099,11 @@
    (let [data (cond-> data (ref? data) (->> map-ident (get-in refs)))]
      (if (vector? data)
        ;; join
-       (into []
-         (map #(db->tree query (get-in refs (map-ident %)) refs map-ident))
-         data)
+       (let [step (fn [ident]
+                    (let [ident' (get-in refs (map-ident ident))
+                          query' (cond-> query (map? query) (get (first ident)))] ;; UNION
+                      (db->tree query' ident' refs map-ident)))]
+         (into [] (map step) data))
        ;; map case
        (let [{props false joins true} (group-by join? query)]
          (loop [joins (seq joins) ret {}]
