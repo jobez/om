@@ -746,6 +746,7 @@
                    "transacted '" tx ", " (pr-str id))))
         v    ((:parser cfg) env tx)
         snds (gather-sends env tx (:remotes cfg))]
+    (println c ref (pr-str env) tx v)
     (p/queue! r
       (into (if ref [ref] [])
         (remove symbol? (keys v))))
@@ -783,6 +784,7 @@
          :read/this :read/that])"
   ([x tx]
    {:pre [(vector? tx)]}
+   (println "tx is" tx (parent x))
    (if (reconciler? x)
      (transact* x nil nil tx)
      (do
@@ -790,8 +792,10 @@
          (str "transact! invoked by component " x
               " that does not implement IQuery"))
        (loop [p (parent x) x x tx tx]
+         (println p x tx)
          (if (nil? p)
            (let [r (get-reconciler x)]
+             (println "transform-reads" (transform-reads r tx))
              (transact* r x nil (transform-reads r tx)))
            (let [[x' tx] (if (satisfies? ITxIntercept p)
                           [p (tx-intercept p tx)]
@@ -829,12 +833,14 @@
           rootq             (get-query x)
           class             (cond-> x (component? x) type)]
       (letfn [(build-index* [class query path classpath]
+                (println "index-root" class query path classpath)
                 (let [recursive? (some #{class} classpath)
                       classpath  (cond-> classpath
                                    (and (not (nil? class))
                                         (not recursive?))
                                    (conj class))]
                   (when class
+                    (println class (focus-query rootq path) rootq path)
                     (swap! class-path->query update-in [classpath]
                       (fnil conj #{})
                       (query-template (focus-query rootq path) path)))
@@ -952,13 +958,15 @@
    om.next/get-query."
   ([component]
    (when (satisfies? IQuery component)
+     (println "path thing" (path component))
      (if (nil? (path component))
        (replace
          (first
            (get-in @(-> component get-reconciler get-indexer)
              [:class-path->query (class-path component)]))
          (get-query component))
-       (full-query component (get-query component)))))
+       (do (println (path component))
+         (full-query component (get-query component))))))
   ([component query]
    (when (satisfies? IQuery component)
      (let [path' (into [] (remove number?) (path component))
@@ -1198,8 +1206,9 @@
   (let [config (:config reconciler)
         state  (:state config)
         merge  (:merge config)
-        {:keys [keys next tempids]} (merge reconciler @state delta)]
+        {:keys [keys next tempids] :as thing} (merge reconciler @state delta)]
     (p/queue! reconciler keys)
+    (println "merge logs" (pr-str delta) (pr-str thing))
     (reset! state
       (if-let [migrate (:migrate config)]
         (migrate next (get-query (:root @(:state reconciler)))
@@ -1227,6 +1236,7 @@
           (swap! state assoc :normalized true)
           (p/queue! this [::skip])))
       (let [renderf (fn [data]
+                      (println "data going down the hatch..." (pr-str data))
                       (binding [*reconciler* this
                                 *shared*     (merge
                                                (:shared config)
@@ -1242,7 +1252,7 @@
                             (swap! state assoc :root c)
                             (reset! ret c)))))
             parsef  (fn []
-                      (let [sel (get-query (or @ret root-class))]
+                      (let [sel (get-query (or root-class @ret))]
                         (if-not (nil? sel)
                           (let [env (to-env config)
                                 v   ((:parser config) env sel)]
@@ -1264,11 +1274,14 @@
             (swap! state update-in [:t] inc)
             (schedule-render! this)))
         (parsef)
-        (when-let [sel (get-query (or @ret root-class))]
+        (println "ROOT" @ret root-class (get-query (or root-class @ret)))
+        (when-let [sel (get-query (or root-class @ret))]
           (let [env  (to-env config)
                 snds (gather-sends env sel (:remotes config))]
+            (println "sends look like" snds)
             (when-not (empty? snds)
               (when-let [send (:send config)]
+                (println "send is happening")
                 (send snds
                   #(do
                     (merge! this %)
@@ -1319,10 +1332,12 @@
                    #(into %1 %2) #{} q)
               {:keys [ui->props]} config
               env (to-env config)]
+          (println cs "from reconcile thing" q "queue")
           (doseq [c ((:optimize config) cs)]
             (when (mounted? c)
               (let [computed   (get-computed (props c))
                     next-props (om.next/computed (ui->props env c) computed)]
+                (println c next-props "RECONCILE")
                 (when (should-update? c next-props (get-state c))
                   (if-not (nil? next-props)
                     (update-component! c next-props)
@@ -1332,6 +1347,7 @@
 
   (send! [this]
     (let [sends (:queued-sends @state)]
+      (println sends "sending")
       (when-not (empty? sends)
         (swap! state
           (fn [state]
