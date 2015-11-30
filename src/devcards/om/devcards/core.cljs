@@ -324,8 +324,8 @@
     {:value (om/db->tree query (:tree st) st)}))
 
 (defmethod norm-tree-read :node/by-id
-  [{:keys [state query query/root]} _ _]
-  (om/db->tree query root @state))
+  [{:keys [state query query-root]} _ _]
+  (om/db->tree query query-root @state))
 
 (defmulti norm-tree-mutate om/dispatch)
 
@@ -398,6 +398,3 @@
 (comment
   (pprint/pprint @(-> norm-tree-reconciler :config :indexer))
   )
-
-;; -----------------------------------------------------------------------------
-;; Layered Recursive Query Syntax

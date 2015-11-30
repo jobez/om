@@ -162,16 +162,18 @@
          {:type :prop :key :foo :dispatch-key :foo}))
   (is (= (parser/expr->ast [:foo 0])
          {:type :prop :key [:foo 0] :dispatch-key :foo}))
-  (is (= (parser/expr->ast {:foo [:bar]})
-         {:type :prop :key :foo :dispatch-key :foo :query [:bar]}))
-  (is (= (parser/expr->ast {[:foo 0] [:bar]})
-          {:type :prop :key [:foo 0] :dispatch-key :foo :query [:bar]}))
+  (is (= (dissoc (parser/expr->ast {:foo [:bar]}) :children)
+         {:type :join, :dispatch-key :foo, :key :foo, :query [:bar]}))
+  (is (= (dissoc (parser/expr->ast {[:foo 0] [:bar]}) :children)
+         {:type :join, :dispatch-key :foo, :key [:foo 0], :query [:bar]}))
   (is (= (parser/expr->ast '(:foo {:bar 1}))
          {:type :prop :key :foo :dispatch-key :foo :params {:bar 1}}))
-  (is (= (parser/expr->ast '({:foo [:bar :baz]} {:woz 1}))
-         {:type :prop :key :foo :dispatch-key :foo :query [:bar :baz] :params {:woz 1}}))
-  (is (= (parser/expr->ast '({[:foo 0] [:bar :baz]} {:woz 1}))
-         {:type :prop :key [:foo 0] :dispatch-key :foo :query [:bar :baz] :params {:woz 1}}))
+  (is (= (dissoc (parser/expr->ast '({:foo [:bar :baz]} {:woz 1})) :children)
+         {:type :join, :dispatch-key :foo, :key :foo, :query [:bar :baz]
+          :params {:woz 1}}))
+  (is (= (dissoc (parser/expr->ast '({[:foo 0] [:bar :baz]} {:woz 1})) :children)
+         {:type :join, :dispatch-key :foo, :key [:foo 0], :query [:bar :baz]
+          :params {:woz 1}}))
   (is (= (parser/expr->ast '(do/it {:woz 1}))
          {:type :call :key 'do/it :dispatch-key 'do/it :params {:woz 1}}))
   (is (= (parser/expr->ast '(do/it))
@@ -182,15 +184,15 @@
          :foo))
   (is (= (parser/ast->expr {:type :prop :key [:foo 0] :dispatch-key :foo})
          [:foo 0]))
-  (is (= (parser/ast->expr {:type :prop :key :foo :dispatch-key :foo :query [:bar]})
+  (is (= (parser/ast->expr {:type :join :key :foo :dispatch-key :foo :query [:bar]})
          {:foo [:bar]}))
-  (is (= (parser/ast->expr {:type :prop :key [:foo 0] :dispatch-key :foo :query [:bar]})
+  (is (= (parser/ast->expr {:type :join :key [:foo 0] :dispatch-key :foo :query [:bar]})
          {[:foo 0] [:bar]}))
   (is (= (parser/ast->expr {:type :prop :key :foo :dispatch-key :foo :params {:bar 1}})
          '(:foo {:bar 1})))
-  (is (= (parser/ast->expr {:type :prop :key :foo :dispatch-key :foo :query [:bar :baz] :params {:woz 1}})
+  (is (= (parser/ast->expr {:type :join :key :foo :dispatch-key :foo :query [:bar :baz] :params {:woz 1}})
          '({:foo [:bar :baz]} {:woz 1})))
-  (is (= (parser/ast->expr {:type :prop :key [:foo 0] :dispatch-key :foo :query [:bar :baz] :params {:woz 1}})
+  (is (= (parser/ast->expr {:type :join :key [:foo 0] :dispatch-key :foo :query [:bar :baz] :params {:woz 1}})
          '({[:foo 0] [:bar :baz]} {:woz 1})))
   (is (= (parser/ast->expr {:type :call :key 'do/it :dispatch-key 'do/it :params {:woz 1}})
          '(do/it {:woz 1})))
@@ -233,7 +235,7 @@
 (defmethod mutate 'do/it!
   [{:keys [state]} k {:keys [id]}]
   {:value {:keys [id]}
-   :action #()
+   :action (fn [])
    :remote true})
 
 (def p (om/parser {:read read :mutate mutate}))
@@ -305,7 +307,9 @@
   {:action #(throw (js/Error.))})
 
 (deftest test-throw
-  (is (instance? js/Error (get (p {} '[(this/throws)]) 'this/throws))))
+  (is
+    (instance? js/Error
+      (get-in (p {} '[(this/throws)]) ['this/throws :om.next/error]))))
 
 ;; -----------------------------------------------------------------------------
 ;; Edge cases
@@ -326,7 +330,8 @@
 
 (deftest test-action-no-value
   (let [state (atom nil)]
-    (is (= (p {:state state} '[(action/no-value)]) {}))
+    (is (= (p {:state state} '[(action/no-value)])
+           '{action/no-value {:result :changed}}))
     (is (= :changed @state)))
   (let [state (atom nil)]
     (is (= (p {:state state} '[(action/no-value)] :remote) []))
@@ -617,8 +622,8 @@
 ;; Path Optimization
 
 (defmethod tree-read :node/by-id
-  [{:keys [state query query/root]} _ _]
-  {:value (om/db->tree query root @state)})
+  [{:keys [state query query-root]} _ _]
+  {:value (om/db->tree query query-root @state)})
 
 (deftest test-read-ident
   (let [state  (atom (om/tree->db Tree tree-data true))
@@ -686,14 +691,24 @@
 
 (defmethod precise-read :real/key
   [{:keys [ast] :as env} _ _]
-  {:remote (assoc ast :query/root true)})
+  {:remote (assoc ast :query-root true)})
 
 (deftest test-rewrite
   (is (= ((om/rewrite {:real/key [:fake/key :real/key]})
            {:real/key 1})
          {:fake/key {:real/key 1}})))
 
+(deftest test-query-root
+  (let [ast (assoc (parser/expr->ast {:real/key [:id]})
+              :query-root true)]
+    (is (= (meta (parser/ast->expr ast)) {:query-root true}))))
+
 (deftest test-process-roots
+  (let [p (om/parser {:read precise-read})
+        m (om/process-roots
+            (p {:state (atom {})}
+              [{:fake/key [{:real/key [:id]}]}] :remote))]
+    (is (= [{:real/key [:id]}] (:query m))))
   (is (= (let [p (om/parser {:read precise-read})]
            ((:rewrite
               (om/process-roots
@@ -701,6 +716,13 @@
                   [{:fake/key [{:real/key [:id]}]}] :remote)))
              {:real/key 1}))
          {:fake/key {:real/key 1}})))
+
+(deftest test-process-roots-recursive
+  (let [p (om/parser {:read precise-read})
+        m (om/process-roots
+            (p {:state (atom {})}
+              '[{:fake/key [{:real/key ...}]}] :remote))]
+    (is (= [{:real/key '...}] (:query m)))))
 
 ;; -----------------------------------------------------------------------------
 ;; User Bugs
@@ -823,3 +845,43 @@
       (is (contains? (get db' :post) 1))
       (is (= (get db' :dashboard/items)
              [[:post 0] [:post 1]])))))
+
+;; -----------------------------------------------------------------------------
+;; Query Ident Test
+
+(def link-data
+  {:current-user {:email "bob.smith@gmail.com"}
+   :settings {0 {:foo :bar}}
+   :items [{:id 0 :title "Foo"}
+           {:id 1 :title "Bar"}
+           {:id 2 :title "Baz"}]})
+
+(defmulti link-read om/dispatch)
+
+(defmethod link-read :items
+  [{:keys [query state ast]} k _]
+  (let [st @state]
+    {:value  (om/db->tree query (get st k) st)
+     :remote (update-in ast [:query] #(into [] (remove om/ident?) %))}))
+
+(defui LinkItem
+  static om/Ident
+  (ident [_ {:keys [id]}]
+    [:item/by-id id])
+  static om/IQuery
+  (query [_]
+    '[:id :title [:current-user _] [:settings 0]]))
+
+(defui LinkList
+  static om/IQuery
+  (query [_]
+    [{:items (om/get-query LinkItem)}]))
+
+(deftest test-db->tree-idents-in-query
+  (let [parser (om/parser {:read link-read})
+        state  (atom (om/tree->db LinkList link-data true))
+        ui     (parser {:state state} (om/get-query LinkList))]
+    (is (every? #(contains? % :current-user) (:items ui)))
+    (is (every? #(contains? % [:settings 0]) (:items ui)))
+    (is (= (parser {:state state} (om/get-query LinkList) :remote)
+           [{:items [:id :title]}]))))

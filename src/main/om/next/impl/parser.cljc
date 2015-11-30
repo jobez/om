@@ -13,11 +13,12 @@
    expressions follows:
 
    QueryRoot    := EdnVector(QueryExpr*)
-   QueryExpr    := EdnKeyword | IdentExpr | ParamExpr | JoinExpr
+   QueryExpr    := (EdnKeyword | IdentExpr | ParamExpr | JoinExpr | UnionExpr)
    IdentExpr    := EdnVector2(Keyword, EdnValue)
    ParamExpr    := EdnList2(QueryExpr | EdnSymbol, ParamMapExpr)
    ParamMapExpr := EdnMap(Keyword, EdnValue)
-   JoinExpr     := EdnMap(Keyword | IdentExpr, QueryRoot | RecurExpr)
+   JoinExpr     := EdnMap((Keyword | IdentExpr), (QueryRoot | UnionExpr | RecurExpr))
+   UnionExpr    := EdnMap(Keyword, QueryRoot)
    RecurExpr    := '...
 
    Note most apis in Om Next expect a QueryRoot not a QueryExpr.
@@ -27,11 +28,12 @@
    Given a QueryExpr you can get the AST via om.next.impl.parser/expr->ast.
    The following keys can appear in the AST representation:
 
-   {:type         (:prop | :call)
+   {:type         (:prop | :join | :call | :root)
     :key          (EdnKeyword | EdnSymbol | IdentExpr)
     :dispatch-key (EdnKeyword | EdnSymbol)
     :query        (QueryRoot | RecurExpr)
-    :params       (ParamMapExpr)}
+    :params       ParamMapExpr
+    :children     EdnVector(AST)}
 
    :query and :params may or may not appear. :type :call is only for
    mutations."}
@@ -55,15 +57,21 @@
       (cond-> ast
         (symbol? (:dispatch-key ast)) (assoc :type :call)))))
 
+(defn query->ast
+  "Convert a query to its AST representation."
+  [query]
+  {:type :root
+   :children (into [] (map expr->ast) query)})
+
 (defn join->ast [join]
   (let [[k v] (first join)
-        ast   (expr->ast k)
-        ref?  (vector? (:key ast))]
-    (assoc ast
-      :type :prop
-      :query v)))
+        ast   (expr->ast k)]
+    (merge ast
+      {:type :join :query v}
+      (when-not (= '... v)
+        {:children (into [] (map expr->ast) v)}))))
 
-(defn ref->ast [[k id :as ref]]
+(defn ident->ast [[k id :as ref]]
   {:type :prop
    :dispatch-key k
    :key ref})
@@ -75,7 +83,7 @@
     (symbol? x)  (symbol->ast x)
     (keyword? x) (keyword->ast x)
     (map? x)     (join->ast x)
-    (vector? x)  (ref->ast x)
+    (vector? x)  (ident->ast x)
     (seq? x)     (call->ast x)
     :else        (throw
                    (ex-info (str "Invalid expression " x)
@@ -85,20 +93,27 @@
   (if root?
     (with-meta
       (cond-> expr (keyword? expr) list)
-      {:query/root true})
+      {:query-root true})
     expr))
 
 (defn ast->expr
   "Given a query expression AST convert it back into a query expression."
-  [{:keys [key query params query/root] :as ast}]
-  (wrap-expr root
-    (if-not (nil? params)
-      (if-not (empty? params)
-        (list (ast->expr (dissoc ast :params)) params)
-        (list (ast->expr (dissoc ast :params))))
-      (if-not (nil? query)
-        {key query}
-        key))))
+  ([ast]
+    (ast->expr ast false))
+  ([{:keys [type] :as ast} unparse-children?]
+   (if (= :root type)
+     (into [] (map ast->expr) (:children ast))
+     (let [{:keys [key query query-root params]} ast]
+       (wrap-expr query-root
+         (if-not (nil? params)
+           (if-not (empty? params)
+             (list (ast->expr (dissoc ast :params)) params)
+             (list (ast->expr (dissoc ast :params))))
+           (if-not (nil? query)
+             (if (true? unparse-children?)
+               {key (ast->expr (:children ast) unparse-children?)}
+               {key query})
+             key)))))))
 
 (defn path-meta [x path]
   (let [x' (cond->> x
@@ -122,48 +137,49 @@
     ([env query target]
      (let [elide-paths? (boolean (:elide-paths config))
            {:keys [path] :as env}
-           (cond-> (assoc env :parser self :target target :query/root :om.next/root)
+           (cond-> (assoc env :parser self :target target :query-root :om.next/root)
              (not (contains? env :path)) (assoc :path []))]
        (letfn [(step [ret expr]
                  (let [{query' :query :keys [key dispatch-key params] :as ast} (expr->ast expr)
-                       env   (as-> (assoc env :ast ast) env
-                               (if (= '... query')
-                                 (assoc env :query query)
-                                 (cond-> env
-                                   (not (nil? query')) (assoc :query query')))
-                               (if (vector? key)
-                                 (assoc env :query/root key)
-                                 env))
+                       env   (cond-> (merge env {:ast ast :query query'})
+                               (nil? query')   (dissoc :query)
+                               (= '... query') (assoc :query query)
+                               (vector? key)   (assoc :query-root key))
                        type  (:type ast)
                        call? (= :call type)
-                       res   (when (nil? (:target ast))
-                               (case type
-                                 :call (do
-                                         (assert mutate "Parse mutation attempted but no :mutate function supplied")
-                                         (mutate env dispatch-key params))
-                                 :prop (do
-                                         (assert read "Parse read attempted but no :read function supplied")
-                                         (read env dispatch-key params))))]
+                       res   (case type
+                               :call
+                               (do
+                                 (assert mutate "Parse mutation attempted but no :mutate function supplied")
+                                 (mutate env dispatch-key params))
+                               (:prop :join)
+                               (do
+                                 (assert read "Parse read attempted but no :read function supplied")
+                                 (read env dispatch-key params)))]
                    (if-not (nil? target)
                      (let [ast' (get res target)]
                        (cond-> ret
                          (true? ast') (conj expr)
-                         (map? ast') (conj (ast->expr ast'))
-                         (= target (:target ast')) (conj (ast->expr ast'))))
+                         (map? ast') (conj (ast->expr ast'))))
                      (if-not (or call? (nil? (:target ast)) (contains? res :value))
                        ret
-                       (let [error (atom nil)]
+                       (let [error   (atom nil)
+                             mut-ret (atom nil)]
                          (when (and call? (not (nil? (:action res))))
                            (try
-                             ((:action res))
+                             (reset! mut-ret ((:action res)))
                              (catch #?(:clj Throwable :cljs :default) e
                                (if (rethrow? e)
                                  (throw e)
                                  (reset! error e)))))
                          (let [value (:value res)]
+                           (when call?
+                             (assert (or (nil? value) (map? value))
+                               (str dispatch-key " mutation :value must be nil or a map with structure {:keys [...]}")))
                            (cond-> ret
                              (not (nil? value)) (assoc key value)
-                             @error (assoc key @error))))))))]
+                             @mut-ret (assoc-in [key :result] @mut-ret)
+                             @error (assoc key {:om.next/error @error}))))))))]
          (cond-> (reduce step (if (nil? target) {} []) query)
            (not (or (not (nil? target)) elide-paths?)) (path-meta path)))))))
 
